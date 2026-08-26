@@ -257,6 +257,17 @@ pub enum CursorStyle {
     BeamBlink,
 }
 
+/// Selects the shell used when a new local terminal is opened on Windows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalTerminalShell {
+    #[default]
+    WindowsPowerShell,
+    PowerShell7,
+    CommandPrompt,
+    GitBash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default = "default_follow_system_theme")]
@@ -273,6 +284,8 @@ pub struct ConfigFile {
     pub terminal_font_size: f32,
     #[serde(default)]
     pub local_terminal_encoding: TextEncoding,
+    #[serde(default)]
+    pub local_terminal_shell: LocalTerminalShell,
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
     #[serde(default)]
@@ -393,8 +406,11 @@ fn default_locale() -> String {
 }
 
 fn default_terminal_font_size() -> f32 {
-    18.0
+    12.0
 }
+
+const LEGACY_DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
+const LEGACY_DEFAULT_UI_FONT_SIZE: f32 = 16.0;
 
 fn default_ui_font_size() -> f32 {
     14.0
@@ -449,6 +465,7 @@ impl Default for ConfigFile {
             locale: default_locale(),
             terminal_font_size: default_terminal_font_size(),
             local_terminal_encoding: TextEncoding::Utf8,
+            local_terminal_shell: LocalTerminalShell::default(),
             ui_font_size: default_ui_font_size(),
             right_click_copy_paste: false,
             keyword_highlight: false,
@@ -1150,7 +1167,9 @@ impl ConfigStore {
     }
 
     pub fn terminal_font_size(&self) -> f32 {
-        if self.cache.terminal_font_size <= 0.0 {
+        if self.cache.terminal_font_size <= 0.0
+            || (self.cache.terminal_font_size - LEGACY_DEFAULT_TERMINAL_FONT_SIZE).abs() < 0.01
+        {
             default_terminal_font_size()
         } else {
             self.cache.terminal_font_size
@@ -1260,8 +1279,19 @@ impl ConfigStore {
         self.cache.local_terminal_encoding = encoding;
     }
 
+    pub fn local_terminal_shell(&self) -> LocalTerminalShell {
+        self.cache.local_terminal_shell
+    }
+
+    pub fn set_local_terminal_shell(&mut self, shell: LocalTerminalShell) {
+        self.cache.local_terminal_shell = shell;
+    }
+
     pub fn ui_font_size(&self) -> f32 {
-        if self.cache.ui_font_size <= 0.0 {
+        if self.cache.ui_font_size <= 0.0
+            || (self.cache.ui_font_size - LEGACY_DEFAULT_UI_FONT_SIZE).abs() < 0.01
+        {
+            // Migrate the previous application default to the current compact default.
             default_ui_font_size()
         } else {
             self.cache.ui_font_size
@@ -1269,7 +1299,7 @@ impl ConfigStore {
     }
 
     pub fn set_ui_font_size(&mut self, ui_font_size: f32) {
-        self.cache.ui_font_size = ui_font_size.max(8.0);
+        self.cache.ui_font_size = ui_font_size.clamp(10.0, 28.0);
     }
 
     pub fn ui_font_family(&self) -> &str {
@@ -1480,6 +1510,7 @@ impl ConfigStore {
         disk_config.locale = local_config.locale;
         disk_config.terminal_font_size = local_config.terminal_font_size;
         disk_config.local_terminal_encoding = local_config.local_terminal_encoding;
+        disk_config.local_terminal_shell = local_config.local_terminal_shell;
         disk_config.ui_font_size = local_config.ui_font_size;
         disk_config.right_click_copy_paste = local_config.right_click_copy_paste;
         disk_config.keyword_highlight = local_config.keyword_highlight;
@@ -1526,6 +1557,21 @@ pub trait ProxyStream:
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static> ProxyStream
     for T
 {
+}
+
+/// Build the shared russh client configuration used by terminal and SFTP sessions.
+///
+/// Keep russh's modern key-exchange order intact, then add the SHA-1 group14
+/// algorithm as a final fallback for legacy OpenSSH servers such as OpenSSH 5.x.
+pub(crate) fn ssh_client_config() -> russh::client::Config {
+    let mut config = russh::client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(std::time::Duration::from_secs(5)),
+        keepalive_max: 3,
+        ..Default::default()
+    };
+    config.preferred.kex.to_mut().push(russh::kex::DH_G14_SHA1);
+    config
 }
 
 #[derive(Debug, Clone)]
@@ -1889,7 +1935,37 @@ mod tests {
         assert!(!config.sftp_file_columns_customized);
         assert!(config.connection_groups.is_empty());
         assert_eq!(config.local_terminal_encoding, TextEncoding::Utf8);
+        assert_eq!(
+            config.local_terminal_shell,
+            LocalTerminalShell::WindowsPowerShell
+        );
         assert!(config.collapsed_connection_groups.is_empty());
+    }
+
+    #[test]
+    fn font_sizes_migrate_the_previous_defaults() {
+        let mut store = ConfigStore::in_memory();
+
+        assert_eq!(store.terminal_font_size(), 12.0);
+        assert_eq!(store.ui_font_size(), 14.0);
+
+        store.set_terminal_font_size(18.0);
+        assert_eq!(store.terminal_font_size(), 12.0);
+
+        store.set_ui_font_size(14.0);
+        assert_eq!(store.ui_font_size(), 14.0);
+
+        store.set_ui_font_size(20.0);
+        assert_eq!(store.ui_font_size(), 20.0);
+    }
+
+    #[test]
+    fn legacy_ssh_key_exchange_is_only_a_fallback() {
+        let config = ssh_client_config();
+        let kex = config.preferred.kex.as_ref();
+
+        assert_eq!(kex.last(), Some(&russh::kex::DH_G14_SHA1));
+        assert_eq!(kex.first(), Some(&russh::kex::CURVE25519));
     }
 
     #[test]
@@ -1966,6 +2042,7 @@ mod tests {
     #[test]
     fn test_saved_tabs_roundtrip() {
         let config = ConfigFile {
+            local_terminal_shell: LocalTerminalShell::PowerShell7,
             remember_tabs: true,
             saved_tabs: Some(SavedTabsState {
                 groups: vec![SavedTabGroup {
@@ -1990,6 +2067,10 @@ mod tests {
         let restored: ConfigFile = serde_json::from_str(&json).unwrap();
 
         assert!(restored.remember_tabs);
+        assert_eq!(
+            restored.local_terminal_shell,
+            LocalTerminalShell::PowerShell7
+        );
         let restored_tabs = restored.saved_tabs.unwrap();
         assert_eq!(restored_tabs.groups.len(), 1);
         assert_eq!(restored_tabs.active_tab.as_deref(), Some("tab-1"));
@@ -2034,6 +2115,7 @@ mod tests {
             ui_font_size: 18.0,
             terminal_font_size: 20.0,
             local_terminal_encoding: TextEncoding::Gbk,
+            local_terminal_shell: LocalTerminalShell::GitBash,
             show_hidden_files: true,
             sftp_file_columns_customized: true,
             remember_tabs: true,
@@ -2072,6 +2154,7 @@ mod tests {
         assert_eq!(decrypted.ui_font_size, 18.0);
         assert_eq!(decrypted.terminal_font_size, 20.0);
         assert_eq!(decrypted.local_terminal_encoding, TextEncoding::Gbk);
+        assert_eq!(decrypted.local_terminal_shell, LocalTerminalShell::GitBash);
         assert!(decrypted.show_hidden_files);
         assert!(decrypted.sftp_file_columns_customized);
         assert!(decrypted.remember_tabs);

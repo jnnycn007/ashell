@@ -16,7 +16,10 @@ use russh::{
     client::{self, Handler},
     keys::{PrivateKey, decode_secret_key, load_secret_key},
 };
-use russh_sftp::{client::SftpSession, protocol::FileAttributes};
+use russh_sftp::{
+    client::SftpSession,
+    protocol::{FileAttributes, OpenFlags},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{
@@ -775,12 +778,7 @@ async fn emit_entries(
 async fn connect_and_authenticate(
     session: &Session,
 ) -> Result<Arc<russh::client::Handle<SftpClientHandler>>> {
-    let config = Arc::new(client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(std::time::Duration::from_secs(5)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
+    let config = Arc::new(crate::session::config::ssh_client_config());
     let addr = format!("{}:{}", session.host, session.port);
     let stream = crate::session::config::connect_proxy(session).await?;
     let mut handle = client::connect_stream(config, stream, SftpClientHandler)
@@ -1218,9 +1216,33 @@ async fn write_text_file_impl(sftp: &SftpSession, path: &str, content: &[u8]) ->
             .with_context(|| format!("preserve permissions for {path}"))?;
         }
 
-        sftp.rename(temporary_path.as_str(), path)
-            .await
-            .with_context(|| format!("replace remote {path}"))
+        match sftp.rename(temporary_path.as_str(), path).await {
+            Ok(()) => Ok(()),
+            Err(rename_error) => {
+                // Some SFTP servers reject replacing an existing path with the standard
+                // rename request. If the original file is still present, fall back to
+                // truncating it in place instead of deleting it before the write succeeds.
+                if sftp.metadata(path).await.is_err() {
+                    return Err(rename_error).with_context(|| format!("replace remote {path}"));
+                }
+
+                let mut remote_file = sftp
+                    .open_with_flags(path, OpenFlags::WRITE | OpenFlags::TRUNCATE)
+                    .await
+                    .with_context(|| format!("open remote {path} for overwrite"))?;
+                remote_file
+                    .write_all(content)
+                    .await
+                    .with_context(|| format!("write remote {path}"))?;
+                remote_file
+                    .flush()
+                    .await
+                    .with_context(|| format!("flush remote {path}"))?;
+                drop(remote_file);
+                let _ = sftp.remove_file(temporary_path.as_str()).await;
+                Ok(())
+            }
+        }
     }
     .await;
 
