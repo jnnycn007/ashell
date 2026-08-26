@@ -145,6 +145,10 @@ fn should_show_terminal_notification(
     window_active: bool,
     terminal_visible: bool,
 ) -> bool {
+    if window_active && terminal_visible {
+        return false;
+    }
+
     match occasion {
         TerminalNotificationOccasion::Always => true,
         TerminalNotificationOccasion::Unfocused => !window_active,
@@ -280,6 +284,7 @@ pub(crate) struct Ashell {
     pub(crate) connection_filter_input: Entity<InputState>,
     pub(crate) connection_group_name_input: Entity<InputState>,
     pub(crate) command_history_filter_input: Entity<InputState>,
+    pub(crate) connection_management_mode: bool,
     pub(crate) selected_connection_ids: HashSet<String>,
     pub(crate) selected_command_history: HashSet<(String, usize)>,
     pub(crate) ssh_auth_method: AuthMethod,
@@ -790,6 +795,7 @@ impl Ashell {
             connection_filter_input,
             connection_group_name_input,
             command_history_filter_input,
+            connection_management_mode: false,
             selected_connection_ids: HashSet::new(),
             selected_command_history: HashSet::new(),
             ssh_auth_method: AuthMethod::Password,
@@ -1110,6 +1116,7 @@ impl Ashell {
         })
     }
 
+    /// Dispatch a terminal notification and retain its unread state while its tab is hidden.
     fn handle_terminal_notification(&mut self, tab_id: &str, notification: TerminalNotification) {
         let terminal_visible = self.is_terminal_visible(tab_id);
         tracing::info!(
@@ -1134,7 +1141,6 @@ impl Ashell {
             .unwrap_or_else(|| "ashell".to_string());
         let title = notification.title.unwrap_or(fallback_title);
         let body = notification.body.unwrap_or_default();
-        crate::desktop_notification::show_terminal_notification(title, body);
         if !terminal_visible
             && self
                 .unread_terminal_notifications
@@ -1142,6 +1148,27 @@ impl Ashell {
         {
             self.update_unread_indicator();
         }
+        crate::desktop_notification::show_terminal_notification(tab_id.to_string(), title, body);
+    }
+
+    fn handle_terminal_notification_activations(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut handled = false;
+        while let Some(tab_id) =
+            crate::desktop_notification::take_terminal_notification_activation()
+        {
+            handled = true;
+            window.activate_window();
+            if self.tabs.iter().any(|tab| tab.id == tab_id) {
+                self.activate_tab(tab_id, window, cx);
+            } else {
+                tracing::info!(tab_id, "ignored activation for a closed terminal tab");
+            }
+        }
+        handled
     }
 
     fn is_terminal_visible(&self, tab_id: &str) -> bool {
@@ -1257,6 +1284,8 @@ impl Ashell {
                     .await;
                 if this
                     .update_in(cx, |this, window, cx| {
+                        let terminal_notification_activated =
+                            this.handle_terminal_notification_activations(window, cx);
                         let activation_changed = this.sync_window_activation(window);
                         let changed = this.drain_backend_events(cx);
                         let system_sampled = this.sample_system_if_due();
@@ -1271,7 +1300,8 @@ impl Ashell {
                         let blink_due = is_blinking
                             && now.duration_since(last_blink_time)
                                 >= std::time::Duration::from_millis(600);
-                        if activation_changed
+                        if terminal_notification_activated
+                            || activation_changed
                             || changed
                             || system_sampled
                             || activity_changed
@@ -2252,10 +2282,15 @@ mod terminal_notification_tests {
 
     #[test]
     fn applies_terminal_notification_occasion_rules() {
-        assert!(should_show_terminal_notification(
+        assert!(!should_show_terminal_notification(
             TerminalNotificationOccasion::Always,
             true,
             true,
+        ));
+        assert!(should_show_terminal_notification(
+            TerminalNotificationOccasion::Always,
+            true,
+            false,
         ));
         assert!(!should_show_terminal_notification(
             TerminalNotificationOccasion::Unfocused,
