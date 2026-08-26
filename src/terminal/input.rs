@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::term::{TermMode, cell::Flags};
 use gpui::{
     ClipboardItem, Context, Focusable as _, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, px,
@@ -324,6 +325,7 @@ impl Ashell {
         }
         tab.clear_selection();
         self.terminal_marked_text = None;
+        tab.record_terminal_input(&bytes);
         let encoded = tab.encode_input(&bytes);
         tab.send_backend(BackendCommand::Input(encoded));
         window.invalidate_character_coordinates();
@@ -351,6 +353,7 @@ impl Ashell {
         if is_alternate_screen_active {
             self.ssh_command_buffers.remove(tab_id);
             self.ssh_command_starts.remove(tab_id);
+            self.ssh_command_input_uncertain.remove(tab_id);
             return;
         }
 
@@ -358,6 +361,7 @@ impl Ashell {
         let edits_command = bytes
             .iter()
             .any(|byte| !matches!(*byte, b'\r' | b'\n' | b'\x03'));
+        let mut input_uncertain = self.ssh_command_input_uncertain.contains(tab_id);
         if edits_command && !self.ssh_command_starts.contains_key(tab_id) {
             if let Some(cursor) = cursor {
                 self.ssh_command_starts.insert(tab_id.to_string(), cursor);
@@ -373,7 +377,7 @@ impl Ashell {
                         .iter()
                         .find(|tab| tab.id == tab_id)
                         .map(|tab| tab.render_snapshot(false))
-                        .and_then(|snapshot| terminal_command_text(&snapshot, start))
+                        .and_then(|snapshot| terminal_command_text(&snapshot, start, cursor))
                 })
         } else {
             None
@@ -405,15 +409,22 @@ impl Ashell {
                     continue;
                 }
                 match character {
-                    '\x1b' => in_escape = true,
+                    '\x1b' => {
+                        input_uncertain = true;
+                        in_escape = true;
+                    }
                     '\r' | '\n' => {
-                        let command =
-                            merge_command_text(rendered_command.take().as_deref(), buffer);
+                        let command = command_history_text(
+                            rendered_command.take().as_deref(),
+                            buffer,
+                            input_uncertain,
+                        );
                         if !command.is_empty() {
                             completed.push(command);
                         }
                         buffer.clear();
                         reset_command_start = true;
+                        input_uncertain = false;
                     }
                     '\u{8}' | '\u{7f}' => {
                         buffer.pop();
@@ -422,6 +433,7 @@ impl Ashell {
                     '\u{3}' => {
                         buffer.clear();
                         reset_command_start = true;
+                        input_uncertain = false;
                     }
                     '\u{17}' => {
                         let trimmed_len = buffer.trim_end().len();
@@ -434,12 +446,17 @@ impl Ashell {
                         }
                     }
                     character if !character.is_control() => buffer.push(character),
-                    _ => {}
+                    _ => input_uncertain = true,
                 }
             }
         }
         if reset_command_start {
             self.ssh_command_starts.remove(tab_id);
+            self.ssh_command_input_uncertain.remove(tab_id);
+        } else if input_uncertain {
+            self.ssh_command_input_uncertain.insert(tab_id.to_string());
+        } else {
+            self.ssh_command_input_uncertain.remove(tab_id);
         }
 
         let mut changed = false;
@@ -514,6 +531,124 @@ impl Ashell {
         }
     }
 
+    pub(crate) fn move_terminal_cursor_to_click(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((target_row, target_col, _)) = self.terminal_grid_point_and_side(position) else {
+            return false;
+        };
+        let Some(active_id) = self.active_tab.clone() else {
+            return false;
+        };
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active_id) else {
+            return false;
+        };
+        let mode = *tab.term.mode();
+        let click_state = if tab.is_alternate_screen_active() || tab.mouse_tracking_enabled() {
+            None
+        } else {
+            tab.prompt_input_click_state((target_row, target_col))
+        };
+        let (bytes, predicted_cursor) = if let Some(click_state) = click_state {
+            if !prompt_click_is_valid((target_row, target_col), click_state.command_start) {
+                return false;
+            }
+            match click_state.mode {
+                crate::terminal::PromptClickMode::Absolute => (
+                    sgr_prompt_click(
+                        (target_row, target_col),
+                        click_state.prompt_row_offset,
+                        click_state.mode,
+                    ),
+                    None,
+                ),
+                crate::terminal::PromptClickMode::Relative if click_state.relative_click_valid => (
+                    sgr_prompt_click(
+                        (target_row, target_col),
+                        click_state.prompt_row_offset,
+                        click_state.mode,
+                    ),
+                    None,
+                ),
+                crate::terminal::PromptClickMode::Relative
+                | crate::terminal::PromptClickMode::TerminalManaged => {
+                    let Some(cursor) = tab.cursor_state_for_click() else {
+                        return false;
+                    };
+                    let snapshot = tab.render_snapshot(false);
+                    let movement = prompt_cursor_move(
+                        &snapshot,
+                        cursor,
+                        (target_row, target_col),
+                        &click_state.command_starts,
+                        tab.app_cursor_mode(),
+                    );
+                    let predicted_cursor = crate::terminal::CursorState {
+                        row: movement.target.0,
+                        col: movement.target.1,
+                        shape: cursor.shape,
+                    };
+                    (movement.bytes, Some(predicted_cursor))
+                }
+            }
+        } else if tab.mouse_tracking_enabled() {
+            (terminal_mouse_click((target_row, target_col), mode), None)
+        } else if tab.is_alternate_screen_active() {
+            let Some(cursor) = tab.cursor_state_for_click() else {
+                return false;
+            };
+            let snapshot = tab.render_snapshot(false);
+            let movement = alternate_screen_cursor_move(
+                &snapshot,
+                cursor,
+                (target_row, target_col),
+                tab.app_cursor_mode(),
+            );
+            let predicted_cursor = crate::terminal::CursorState {
+                row: movement.target.0,
+                col: movement.target.1,
+                shape: cursor.shape,
+            };
+            (movement.bytes, Some(predicted_cursor))
+        } else {
+            let Some(cursor) = tab.cursor_state_for_click() else {
+                return false;
+            };
+            let snapshot = tab.render_snapshot(false);
+            let movement = prompt_cursor_move(
+                &snapshot,
+                cursor,
+                (target_row, target_col),
+                &[],
+                tab.app_cursor_mode(),
+            );
+            let predicted_cursor = crate::terminal::CursorState {
+                row: movement.target.0,
+                col: movement.target.1,
+                shape: cursor.shape,
+            };
+            (movement.bytes, Some(predicted_cursor))
+        };
+        tab.clear_selection();
+        if let Some(predicted_cursor) = predicted_cursor {
+            if !bytes.is_empty() {
+                tab.note_click_cursor_move(predicted_cursor);
+            }
+        } else {
+            tab.clear_click_cursor_prediction();
+        }
+        if !bytes.is_empty() {
+            tab.send_backend(crate::terminal::BackendCommand::Input(bytes));
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+        true
+    }
+
     pub(crate) fn on_terminal_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -523,7 +658,7 @@ impl Ashell {
         // Handle split drag
         if self.dragging_splitter.is_some() {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.on_split_drag_move(event, window, cx);
+                self.on_split_drag_move(event, window);
                 cx.notify();
             } else {
                 self.end_drag_split();
@@ -654,9 +789,13 @@ impl Ashell {
         let line_height = px(self.terminal_line_height());
         let snapshot = self.active_snapshot()?;
         let max_col = snapshot.cols.saturating_sub(1);
-        let max_row = snapshot.rows.saturating_sub(1);
         let col = ((local_x / cell_width).floor() as usize).min(max_col);
-        let row = ((local_y / line_height).floor() as usize).min(max_row);
+        let row = terminal_grid_row(
+            local_y.as_f32(),
+            bounds.size.height.as_f32(),
+            line_height.as_f32(),
+            snapshot.rows,
+        );
         let cell_offset_x = px(local_x.as_f32() % cell_width.as_f32());
         let side = if cell_offset_x >= (cell_width / 2.) {
             Side::Right
@@ -714,6 +853,7 @@ impl Ashell {
                 return;
             }
 
+            tab.clear_click_cursor_prediction();
             let mode = tab.term.mode();
 
             let is_mouse_tracking = mode.intersects(
@@ -777,9 +917,372 @@ impl Ashell {
     }
 }
 
+fn terminal_grid_row(
+    local_y: f32,
+    container_height: f32,
+    line_height: f32,
+    row_count: usize,
+) -> usize {
+    let grid_height = (container_height / line_height).floor().max(1.0) * line_height;
+    let y_offset = ((container_height - grid_height) / 2.0).max(0.0);
+    (((local_y - y_offset).max(0.0) / line_height).floor() as usize)
+        .min(row_count.saturating_sub(1))
+}
+
+fn prompt_click_is_valid(target: (usize, usize), command_start: (usize, usize)) -> bool {
+    target.0 > command_start.0 || (target.0 == command_start.0 && target.1 >= command_start.1)
+}
+
+fn append_cursor_key(bytes: &mut Vec<u8>, key: u8, app_cursor_mode: bool) {
+    bytes.extend_from_slice(&crate::terminal::encode_cursor_key(key, app_cursor_mode));
+}
+
+fn snapshot_cell_widths(snapshot: &crate::terminal::RenderSnapshot) -> Vec<usize> {
+    let mut cell_widths = vec![1usize; snapshot.rows.saturating_mul(snapshot.cols)];
+    for render_cell in &snapshot.cells {
+        let Ok(row) = usize::try_from(render_cell.row) else {
+            continue;
+        };
+        let Ok(col) = usize::try_from(render_cell.col) else {
+            continue;
+        };
+        if row >= snapshot.rows || col >= snapshot.cols {
+            continue;
+        }
+
+        let flags = render_cell.cell.flags;
+        cell_widths[row * snapshot.cols + col] =
+            if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                0
+            } else if flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+    }
+    cell_widths
+}
+
+fn snap_cursor_col(cell_widths: &[usize], row: usize, col: usize, cols: usize) -> usize {
+    let mut col = col.min(cols.saturating_sub(1));
+    while col > 0 && cell_widths.get(row * cols + col).copied() == Some(0) {
+        col -= 1;
+    }
+    col
+}
+
+fn horizontal_cursor_move_count(
+    cell_widths: &[usize],
+    row: usize,
+    source_col: usize,
+    target_col: usize,
+    cols: usize,
+) -> usize {
+    if source_col == target_col || cols == 0 {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut col = source_col.min(cols - 1);
+    if col < target_col {
+        while col < target_col {
+            col += 1;
+            while col < target_col && cell_widths.get(row * cols + col).copied() == Some(0) {
+                col += 1;
+            }
+            count += 1;
+        }
+    } else {
+        while col > target_col {
+            col -= 1;
+            while col > target_col && cell_widths.get(row * cols + col).copied() == Some(0) {
+                col -= 1;
+            }
+            count += 1;
+        }
+    }
+    count
+}
+
+fn append_horizontal_cursor_move(
+    bytes: &mut Vec<u8>,
+    cell_widths: &[usize],
+    row: usize,
+    source_col: usize,
+    target_col: usize,
+    cols: usize,
+    app_cursor_mode: bool,
+) {
+    let key = if target_col < source_col { b'D' } else { b'C' };
+    let count = horizontal_cursor_move_count(cell_widths, row, source_col, target_col, cols);
+    for _ in 0..count {
+        append_cursor_key(bytes, key, app_cursor_mode);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CursorMove {
+    bytes: Vec<u8>,
+    target: (usize, usize),
+}
+
+fn alternate_screen_cursor_move(
+    snapshot: &crate::terminal::RenderSnapshot,
+    cursor: crate::terminal::CursorState,
+    target: (usize, usize),
+    app_cursor_mode: bool,
+) -> CursorMove {
+    // Mouse-aware apps bypass this helper and receive exact cell coordinates.
+    // Otherwise mirror iTerm2's predictive fallback; rendered cells no longer
+    // retain enough information to distinguish tabs from literal spaces.
+    if snapshot.rows == 0 || snapshot.cols == 0 {
+        return CursorMove {
+            bytes: Vec::new(),
+            target: (cursor.row, cursor.col),
+        };
+    }
+
+    let cell_widths = snapshot_cell_widths(snapshot);
+    let cursor_row = cursor.row.min(snapshot.rows - 1);
+    let mut position = (
+        cursor_row,
+        snap_cursor_col(&cell_widths, cursor_row, cursor.col, snapshot.cols),
+    );
+    let target_row = target.0.min(snapshot.rows - 1);
+    let target = (
+        target_row,
+        snap_cursor_col(&cell_widths, target_row, target.1, snapshot.cols),
+    );
+    if position == target {
+        return CursorMove {
+            bytes: Vec::new(),
+            target,
+        };
+    }
+
+    let estimated_moves = position.0.abs_diff(target.0) + position.1.abs_diff(target.1);
+    let mut bytes = Vec::with_capacity(estimated_moves.saturating_mul(3));
+
+    // Match iTerm2's ordering so vertical movement cannot clamp a cursor that
+    // first needs to move left to reach the requested column.
+    if position.1 > target.1 {
+        let pre_vertical_col = snap_cursor_col(&cell_widths, position.0, target.1, snapshot.cols);
+        append_horizontal_cursor_move(
+            &mut bytes,
+            &cell_widths,
+            position.0,
+            position.1,
+            pre_vertical_col,
+            snapshot.cols,
+            app_cursor_mode,
+        );
+        position.1 = pre_vertical_col;
+    }
+
+    let vertical_key = if target.0 < position.0 { b'A' } else { b'B' };
+    for _ in 0..position.0.abs_diff(target.0) {
+        append_cursor_key(&mut bytes, vertical_key, app_cursor_mode);
+    }
+    position.0 = target.0;
+    position.1 = snap_cursor_col(&cell_widths, position.0, position.1, snapshot.cols);
+
+    if position.1 != target.1 {
+        append_horizontal_cursor_move(
+            &mut bytes,
+            &cell_widths,
+            position.0,
+            position.1,
+            target.1,
+            snapshot.cols,
+            app_cursor_mode,
+        );
+    }
+
+    CursorMove { bytes, target }
+}
+
+fn prompt_cursor_move(
+    snapshot: &crate::terminal::RenderSnapshot,
+    cursor: crate::terminal::CursorState,
+    target: (usize, usize),
+    command_starts: &[(usize, usize)],
+    app_cursor_mode: bool,
+) -> CursorMove {
+    if snapshot.rows == 0 || snapshot.cols == 0 {
+        return CursorMove {
+            bytes: Vec::new(),
+            target: (cursor.row, cursor.col),
+        };
+    }
+
+    let cell_widths = snapshot_cell_widths(snapshot);
+    let target_row = target.0.min(snapshot.rows.saturating_sub(1));
+    let target = (
+        target_row,
+        snap_cursor_col(&cell_widths, target_row, target.1, snapshot.cols),
+    );
+    let cursor_row = cursor.row.min(snapshot.rows.saturating_sub(1));
+    let cursor_point = (
+        cursor_row,
+        snap_cursor_col(&cell_widths, cursor_row, cursor.col, snapshot.cols),
+    );
+    if target == cursor_point {
+        return CursorMove {
+            bytes: Vec::new(),
+            target,
+        };
+    }
+
+    let (start, end, key) = if target < cursor_point {
+        (target, cursor_point, b'D')
+    } else {
+        (cursor_point, target, b'C')
+    };
+    let mut row_text_starts: Vec<Option<usize>> = vec![None; snapshot.rows];
+    let mut row_text_ends: Vec<Option<usize>> = vec![None; snapshot.rows];
+    let mut row_wraps = vec![false; snapshot.rows];
+    for render_cell in &snapshot.cells {
+        let Ok(row) = usize::try_from(render_cell.row) else {
+            continue;
+        };
+        let Ok(col) = usize::try_from(render_cell.col) else {
+            continue;
+        };
+        if row >= snapshot.rows || col >= snapshot.cols {
+            continue;
+        }
+        let flags = render_cell.cell.flags;
+        row_wraps[row] |= flags.contains(Flags::WRAPLINE);
+        if !flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            let width = cell_widths[row * snapshot.cols + col];
+            if render_cell.cell.c != ' '
+                || render_cell
+                    .cell
+                    .zerowidth()
+                    .is_some_and(|characters| !characters.is_empty())
+            {
+                row_text_starts[row] =
+                    Some(row_text_starts[row].map_or(col, |start| start.min(col)));
+                row_text_ends[row] = Some(
+                    row_text_ends[row]
+                        .map_or(col.saturating_add(width), |end| {
+                            end.max(col.saturating_add(width))
+                        })
+                        .min(snapshot.cols),
+                );
+            }
+        }
+    }
+
+    // Spaces between two cursor positions are real input positions. Only trim
+    // the unused margin of an explicitly-broken row; wrapped rows consume the
+    // complete terminal width.
+    let mut count = 0;
+    for row in start.0..=end.0 {
+        let mut col = if row == start.0 {
+            start.1
+        } else {
+            command_starts
+                .iter()
+                .rev()
+                .find(|(command_row, _)| *command_row == row)
+                .map(|(_, command_col)| *command_col)
+                .or_else(|| {
+                    if row > 0 && row_wraps[row - 1] {
+                        Some(0)
+                    } else {
+                        row_text_starts[row]
+                    }
+                })
+                .unwrap_or(0)
+        };
+        let col_limit = if row == end.0 {
+            end.1.min(snapshot.cols)
+        } else if row_wraps[row] {
+            snapshot.cols
+        } else {
+            row_text_ends[row].unwrap_or(col)
+        };
+        while col < col_limit {
+            let width = cell_widths[row * snapshot.cols + col];
+            if width == 0 {
+                col += 1;
+                continue;
+            }
+            count += 1;
+            col = col.saturating_add(width);
+        }
+        if row < end.0 && !row_wraps[row] {
+            count += 1;
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(count * 3);
+    for _ in 0..count {
+        append_cursor_key(&mut bytes, key, app_cursor_mode);
+    }
+    CursorMove { bytes, target }
+}
+
+fn sgr_prompt_click(
+    target: (usize, usize),
+    prompt_row_offset: usize,
+    click_mode: crate::terminal::PromptClickMode,
+) -> Vec<u8> {
+    let row = match click_mode {
+        crate::terminal::PromptClickMode::Absolute
+        | crate::terminal::PromptClickMode::TerminalManaged => target.0 + 1,
+        crate::terminal::PromptClickMode::Relative => prompt_row_offset + 1,
+    };
+    format!("\x1b[<0;{};{}M", target.1 + 1, row).into_bytes()
+}
+
+fn terminal_mouse_click(target: (usize, usize), mode: TermMode) -> Vec<u8> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            target.1 + 1,
+            target.0 + 1,
+            target.1 + 1,
+            target.0 + 1
+        )
+        .into_bytes();
+    }
+
+    let utf8 = mode.contains(TermMode::UTF8_MOUSE);
+    let max_point = if utf8 { 2015 } else { 223 };
+    if target.0 >= max_point || target.1 >= max_point {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity(12);
+    for button in [0u8, 3u8] {
+        bytes.extend_from_slice(b"\x1b[M");
+        bytes.push(32 + button);
+        append_mouse_coordinate(&mut bytes, target.1, utf8);
+        append_mouse_coordinate(&mut bytes, target.0, utf8);
+    }
+    bytes
+}
+
+fn append_mouse_coordinate(bytes: &mut Vec<u8>, position: usize, utf8: bool) {
+    let encoded = position + 33;
+    if utf8 && position >= 95 {
+        let mut buffer = [0; 4];
+        bytes.extend_from_slice(
+            char::from_u32(encoded as u32)
+                .expect("mouse coordinate is a valid Unicode scalar")
+                .encode_utf8(&mut buffer)
+                .as_bytes(),
+        );
+    } else {
+        bytes.push(encoded as u8);
+    }
+}
+
 fn terminal_command_text(
     snapshot: &crate::terminal::RenderSnapshot,
     start: (usize, usize),
+    end: Option<(usize, usize)>,
 ) -> Option<String> {
     let logical_lines =
         crate::terminal::highlight::build_logical_lines(&snapshot.cells, snapshot.rows);
@@ -792,9 +1295,17 @@ fn terminal_command_text(
             .byte_to_cell
             .iter()
             .position(|(row, col)| *row > start.0 || (*row == start.0 && *col >= start.1))?;
+        let end_byte = end
+            .filter(|(row, col)| *row > start.0 || (*row == start.0 && *col >= start.1))
+            .and_then(|(row, col)| {
+                line.byte_to_cell.iter().position(|(line_row, line_col)| {
+                    *line_row > row || (*line_row == row && *line_col >= col)
+                })
+            })
+            .unwrap_or(line.text.len());
         let command = line
             .text
-            .get(start_byte..)?
+            .get(start_byte..end_byte)?
             .trim_end_matches(|character: char| character == '\0' || character.is_whitespace())
             .replace('\0', "");
         if !command.trim().is_empty() {
@@ -802,6 +1313,14 @@ fn terminal_command_text(
         }
     }
     None
+}
+
+fn command_history_text(rendered: Option<&str>, buffered: &str, input_uncertain: bool) -> String {
+    let buffered = buffered.trim();
+    if !input_uncertain && !buffered.is_empty() {
+        return buffered.to_string();
+    }
+    merge_command_text(rendered, buffered)
 }
 
 fn merge_command_text(rendered: Option<&str>, buffered: &str) -> String {
@@ -831,5 +1350,246 @@ fn merge_command_text(rendered: Option<&str>, buffered: &str) -> String {
         format!("{rendered}{}", &buffered[overlap..])
     } else {
         rendered.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::term::{
+        TermMode,
+        cell::{Cell, Flags},
+    };
+    use alacritty_terminal::vte::ansi::CursorShape;
+
+    use super::{
+        alternate_screen_cursor_move, command_history_text, prompt_click_is_valid,
+        prompt_cursor_move, sgr_prompt_click, terminal_command_text, terminal_grid_row,
+        terminal_mouse_click,
+    };
+    use crate::terminal::{CursorState, PromptClickMode, RenderCell, RenderSnapshot};
+
+    fn snapshot(rows: &[&str], cols: usize) -> RenderSnapshot {
+        let mut cells = Vec::with_capacity(rows.len() * cols);
+        for (row, text) in rows.iter().enumerate() {
+            let characters = text.chars().collect::<Vec<_>>();
+            for col in 0..cols {
+                let mut cell = Cell::default();
+                cell.c = characters.get(col).copied().unwrap_or(' ');
+                cells.push(RenderCell {
+                    row: row as i32,
+                    col: col as i32,
+                    cell,
+                });
+            }
+        }
+        RenderSnapshot {
+            cells,
+            cursor: None,
+            selection: None,
+            display_offset: 0,
+            history_size: 0,
+            rows: rows.len(),
+            cols,
+            highlights: Default::default(),
+        }
+    }
+
+    #[test]
+    fn accounts_for_vertical_grid_centering_when_mapping_clicks() {
+        assert_eq!(terminal_grid_row(10.25, 41.0, 10.0, 4), 0);
+        assert_eq!(terminal_grid_row(10.75, 41.0, 10.0, 4), 1);
+    }
+
+    #[test]
+    fn limits_cursor_clicks_to_the_current_prompt_input() {
+        assert!(!prompt_click_is_valid((2, 8), (3, 5)));
+        assert!(!prompt_click_is_valid((3, 4), (3, 5)));
+        assert!(prompt_click_is_valid((3, 5), (3, 5)));
+        assert!(prompt_click_is_valid((4, 0), (3, 5)));
+        assert!(prompt_click_is_valid((5, 0), (3, 5)));
+    }
+
+    #[test]
+    fn moves_across_wrapped_prompt_rows_with_horizontal_keys() {
+        let mut snapshot = snapshot(&["$ abcdef", "ghijk   "], 8);
+        snapshot
+            .cells
+            .iter_mut()
+            .find(|cell| cell.row == 0 && cell.col == 7)
+            .unwrap()
+            .cell
+            .flags
+            .insert(Flags::WRAPLINE);
+        let cursor = CursorState {
+            row: 1,
+            col: 5,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            prompt_cursor_move(&snapshot, cursor, (0, 4), &[(0, 2)], false).bytes,
+            b"\x1b[D".repeat(9)
+        );
+    }
+
+    #[test]
+    fn counts_leading_spaces_on_a_wrapped_prompt_row() {
+        let mut snapshot = snapshot(&["$ abcdef", "  ghijk "], 8);
+        snapshot
+            .cells
+            .iter_mut()
+            .find(|cell| cell.row == 0 && cell.col == 7)
+            .unwrap()
+            .cell
+            .flags
+            .insert(Flags::WRAPLINE);
+        let cursor = CursorState {
+            row: 1,
+            col: 7,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            prompt_cursor_move(&snapshot, cursor, (0, 4), &[(0, 2)], false).bytes,
+            b"\x1b[D".repeat(11)
+        );
+    }
+
+    #[test]
+    fn counts_spaces_between_prompt_cursor_positions() {
+        let snapshot = snapshot(&["$ cargo run "], 12);
+        let cursor = CursorState {
+            row: 0,
+            col: 11,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            prompt_cursor_move(&snapshot, cursor, (0, 4), &[(0, 2)], false).bytes,
+            b"\x1b[D".repeat(7)
+        );
+    }
+
+    #[test]
+    fn skips_secondary_prompts_when_moving_across_explicit_lines() {
+        let snapshot = snapshot(&["$ echo foo  ", "> bar       "], 12);
+        let cursor = CursorState {
+            row: 1,
+            col: 5,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            prompt_cursor_move(&snapshot, cursor, (0, 4), &[(0, 2), (1, 2)], false,).bytes,
+            b"\x1b[D".repeat(10)
+        );
+    }
+
+    #[test]
+    fn batches_vim_style_movement_in_iterm_order() {
+        let snapshot = snapshot(&["abcdefghij", "abcdefghij", "abcdefghij"], 10);
+        let cursor = CursorState {
+            row: 2,
+            col: 8,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            alternate_screen_cursor_move(&snapshot, cursor, (0, 3), false).bytes,
+            [b"\x1b[D".repeat(5), b"\x1b[A".repeat(2)].concat()
+        );
+
+        let cursor = CursorState {
+            row: 2,
+            col: 3,
+            shape: CursorShape::Block,
+        };
+        assert_eq!(
+            alternate_screen_cursor_move(&snapshot, cursor, (0, 8), true).bytes,
+            [b"\x1bOA".repeat(2), b"\x1bOC".repeat(5)].concat()
+        );
+    }
+
+    #[test]
+    fn snaps_vim_style_movement_off_wide_character_spacers() {
+        let mut snapshot = snapshot(&["abW def"], 8);
+        snapshot.cells[2].cell.flags.insert(Flags::WIDE_CHAR);
+        snapshot.cells[3].cell.flags.insert(Flags::WIDE_CHAR_SPACER);
+        let cursor = CursorState {
+            row: 0,
+            col: 6,
+            shape: CursorShape::Block,
+        };
+        let movement = alternate_screen_cursor_move(&snapshot, cursor, (0, 3), false);
+
+        assert_eq!(movement.bytes, b"\x1b[D".repeat(3));
+        assert_eq!(movement.target, (0, 2));
+    }
+
+    #[test]
+    fn corrects_column_after_crossing_a_wide_character_on_another_row() {
+        let mut snapshot = snapshot(&["abcdefgh", "abcdefgh", "abW defg"], 8);
+        snapshot.cells[18].cell.flags.insert(Flags::WIDE_CHAR);
+        snapshot.cells[19]
+            .cell
+            .flags
+            .insert(Flags::WIDE_CHAR_SPACER);
+        let cursor = CursorState {
+            row: 2,
+            col: 6,
+            shape: CursorShape::Block,
+        };
+
+        assert_eq!(
+            alternate_screen_cursor_move(&snapshot, cursor, (0, 3), false).bytes,
+            [b"\x1b[D".repeat(3), b"\x1b[A".repeat(2), b"\x1b[C".to_vec(),].concat()
+        );
+    }
+
+    #[test]
+    fn encodes_sgr_click_coordinates_for_prompt_modes() {
+        assert_eq!(
+            sgr_prompt_click((4, 7), 2, PromptClickMode::Absolute),
+            b"\x1b[<0;8;5M".to_vec()
+        );
+        assert_eq!(
+            sgr_prompt_click((4, 7), 2, PromptClickMode::Relative),
+            b"\x1b[<0;8;3M".to_vec()
+        );
+    }
+
+    #[test]
+    fn encodes_plain_terminal_mouse_clicks_for_full_screen_apps() {
+        assert_eq!(
+            terminal_mouse_click((4, 7), TermMode::SGR_MOUSE),
+            b"\x1b[<0;8;5M\x1b[<0;8;5m".to_vec()
+        );
+        assert_eq!(
+            terminal_mouse_click((2, 3), TermMode::NONE),
+            vec![0x1b, b'[', b'M', 32, 36, 35, 0x1b, b'[', b'M', 35, 36, 35]
+        );
+    }
+
+    #[test]
+    fn prefers_direct_input_over_stale_rendered_command_suffix() {
+        let command = "sh /site/vocano/vocano-restart.sh";
+        let rendered = format!("{command} /sivovo-re");
+
+        assert_eq!(
+            command_history_text(Some(rendered.as_str()), command, false),
+            command
+        );
+    }
+
+    #[test]
+    fn truncates_rendered_command_at_the_submission_cursor() {
+        let command = "sh /site/vocano/vocano-restart.sh";
+        let rendered = format!("$ {command} /sivovo-re");
+        let snapshot = snapshot(&[rendered.as_str()], rendered.len());
+
+        assert_eq!(
+            terminal_command_text(&snapshot, (0, 2), Some((0, 2 + command.len())),),
+            Some(command.to_string())
+        );
     }
 }
